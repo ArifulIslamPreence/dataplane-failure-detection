@@ -118,8 +118,6 @@ control MyIngress(inout headers hdr,
     register <PortStatus_t> (REGISTER_LENGTH) sop_register; //status of port register
     PortStatus_t port_status;
 
-    register <Allports_t> (REGISTER_LENGTH) port_register; // saving all ports of the switch in a register
-    Allports_t all_ports;
 
     action drop() {
         mark_to_drop(standard_metadata);
@@ -206,11 +204,20 @@ control MyEgress(inout headers hdr,
                  inout standard_metadata_t standard_metadata) {
     
 
+    register <Allports_t> (REGISTER_LENGTH) port_register; // saving all ports of the switch in a register
+    Allports_t all_ports;
 
-    action my_drop(){
+
+    action drop(){
         mark_to_drop(standard_metadata);
     }
 
+    action forward(macAddr_t dstAddr, egressSpec_t port) {
+        standard_metadata.egress_spec = port;
+        hdr.ethernet.srcAddr = hdr.ethernet.dstAddr;
+        hdr.ethernet.dstAddr = dstAddr;
+        hdr.ipv4.ttl = hdr.ipv4.ttl - 1;
+    }
    
 
     // E2E clone to send the clonned packet to the buffer instead of ingress
@@ -233,6 +240,18 @@ control MyEgress(inout headers hdr,
 
     /*set timer action here */
 
+    table send_packet {
+        key = {
+            hdr.ipv4.dstAddr: lpm;
+        }
+        actions = {
+            forward;
+            drop;
+            NoAction;
+        }
+        size = 1024;
+        default_action = drop;
+    }
 
 
     /*
@@ -255,10 +274,10 @@ apply {
 
             /* timer checking will be done here */
 
-            ipv4_lpm.apply();
+            send_packet.apply();
         }
         else {
-            ipv4_lpm.apply();
+            send_packet.apply();
         }
     }
     else {

@@ -168,6 +168,7 @@ timestamp_t time_stamp;
         sop_register.write(port_status, 0);
     }
 
+    // storing the time of the packets into the register
     action get_time (){
 
 

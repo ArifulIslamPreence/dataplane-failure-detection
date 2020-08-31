@@ -2,16 +2,16 @@
 #include <core.p4>
 #include <v1model.p4>
 
-const bit<16> TYPE_IPV4 = 0x800;
+const bit<32> TYPE_IPV4 = 0x800;
 const bit <16> TYPE_PROBE = 10;
 const bit<32> INSTANCE_TYPE_NORMAL = 0;
 const bit <32> INSTANCE_TYPE_EGRESS_CLONE = 1;
-const bit<32> INSTANCE_TYPE_RECIRC = 2;
+
 
 #define REGISTER_LENGTH 255
-#define IS_CLONE (std_meta) (std_meta.instance_type == INSTANCE_TYPE_EGRESS_CLONE)
+#define IS_CLONE (standard_metadata) ()
 
-#const bit<3> E2E_CLONE_SESSION_ID = 5;
+
 
 /*************************************************************************
 *********************** H E A D E R S  ***********************************
@@ -21,12 +21,15 @@ typedef bit<9>  egressSpec_t;
 typedef bit<48> macAddr_t;
 typedef bit<32> ip4Addr_t;
 typedef bit<9> PortStatus_t;
-typedef bit<9> Allports_t;
+typedef bit<32> Allports_t;
+typedef bit<48> timestamps_t;
+
+
 
 header ethernet_t {
     macAddr_t dstAddr;
     macAddr_t srcAddr;
-    bit<16>   etherType;
+    bit<32>   etherType;
 }
 
 header ipv4_t {
@@ -46,10 +49,19 @@ header ipv4_t {
 
 header probe_t {
     bit <2> tag;
+
 }
 
+struct ingress_metadata_t {
+    
+    bit <48> register_index;
+    bit <1> flag ;
+ }
+
 struct metadata {
-    /* empty */
+    
+    ingress_metadata_t ingress_metadata;
+    
 }
 
 struct headers {
@@ -57,6 +69,8 @@ struct headers {
     ipv4_t       ipv4;
     probe_t      probe;
 }
+
+
 
 /*************************************************************************
 *********************** P A R S E R  ***********************************
@@ -81,20 +95,15 @@ parser MyParser(packet_in packet,
 
     state parse_ipv4 {
         packet.extract(hdr.ipv4);
-        transition select (hdr.ipv4.dstAddr){
-            TYPE_PROBE : parse_probe;
-            default : accept;
-            }
+            transition accept;
+            
     }
 
     state parse_probe {
         packet.extract (hdr.probe);
-        transition select (hdr.probe.tag){
-            default : accept;
-        }
+        transition accept;
+        
     }
-
-
 
 }
 
@@ -115,8 +124,14 @@ control MyIngress(inout headers hdr,
                   inout metadata meta,
                   inout standard_metadata_t standard_metadata) {
 
-    register <PortStatus_t> (REGISTER_LENGTH) sop_register; //status of port register
-    PortStatus_t port_status;
+
+
+register <PortStatus_t> (REGISTER_LENGTH) sop_register; //status of port register
+PortStatus_t port_status;
+
+register <timestamp_t> (REGISTER_LENGTH) tm_register; // register to store packet ingress time
+timestamp_t time_stamp;
+
 
 
     action drop() {
@@ -142,11 +157,37 @@ control MyIngress(inout headers hdr,
 
 
     action change_probe_tag(bit <2> tag){
-        modify_field(hdr.probe.tag , tag);
+        hdr.probe.tag = tag;
     }
 
-    action save_port_status(bit <3> port){
+    action save_port_status(bit <9> port){
         sop_register.write(port_status, port);
+    }
+
+    action reset_status_register(){
+        sop_register.write(port_status, 0);
+    }
+
+    action get_time (){
+
+
+        meta.ingress_metadata.flag = 0;
+
+        tm_register.write(meta.ingress_metadata.register_index, (bit<32>) standard_metadata.ingress_global_timestamps);
+        meta.ingress_metadata.register_index = meta.ingress_metadata.register_index + 1;
+
+        // accessing the register
+
+        if (meta.ingress_metadata.register_index  ){  //problem : accessing the register value one by one
+            meta.ingress_metadata.flag = 1;
+            return;
+        }
+
+
+    }
+
+     action send_all_ports (egressSpec_t port){
+        standard_metadata.egress_spec = port;
     }
 
 
@@ -183,13 +224,22 @@ apply {
                     ipv4_backward_lpm.apply();
                 }
                 else if (hdr.probe.tag == 2){
-                    save_port_status(standard_metadata.ingress_port);
+                    save_port_status(standard_metadata.egress_spec);
                     drop();
+                }
+                else if (standard_metadata.instance_type == INSTANCE_TYPE_EGRESS_CLONE){
+                     get_time(standard_metadata.ingress_global_timestamp);
+
+                    if (meta.ingress_metadata.flag == 1){
+                        reset_status_register();
+                        send_all_ports(standard_metadata.ingress_port);
+                    }
                 }
                 else {
                     ipv4_lpm.apply();
                 }
             }
+            ipv4_lpm.apply();
         }
     }
 }
@@ -204,9 +254,6 @@ control MyEgress(inout headers hdr,
                  inout standard_metadata_t standard_metadata) {
     
 
-    register <Allports_t> (REGISTER_LENGTH) port_register; // saving all ports of the switch in a register
-    Allports_t all_ports;
-
 
     action drop(){
         mark_to_drop(standard_metadata);
@@ -218,34 +265,36 @@ control MyEgress(inout headers hdr,
         hdr.ethernet.dstAddr = dstAddr;
         hdr.ipv4.ttl = hdr.ipv4.ttl - 1;
     }
-   
 
     // E2E clone to send the clonned packet to the buffer instead of ingress
 
     action do_e2e_clone(bit <48> smac){
         hdr.ethernet.srcAddr = smac;
-        clone3(CloneType.E2E, E2E_CLONE_SESSION_ID,standard_metadata);
+        clone3(CloneType.E2E, (bit<32>) 32w250,standard_metadata);
     }
 
     action change_probe_tag(bit <2> tag){
-        modify_field(hdr.probe.tag , tag);
+        hdr.probe.tag = tag;
     }
 
     // listing all ports in a register
 
-    action send_all (bit <3> port){
-        port_register.write(all_ports,port);
-        standard_metadata.egress_spec = port_register;
+    action send_all (egressSpec_t port){
+        standard_metadata.egress_spec = port;
     }
 
-    /*set timer action here */
+    action do_recirculate(bit<32> new_ipv4_dstAddr) {
+        hdr.ipv4.dstAddr = new_ipv4_dstAddr;
+        recirculate(standard_metadata);
+    }
+
 
     table send_packet {
         key = {
             hdr.ipv4.dstAddr: lpm;
         }
         actions = {
-            forward;
+            do_recirculate;
             drop;
             NoAction;
         }
@@ -254,41 +303,22 @@ control MyEgress(inout headers hdr,
     }
 
 
-    /*
-    table send_all_ports {
-        key = {
-            std_metadata.instance_type : 1;
-        }
-        actions = {
-            send_all;
-        }
-    }
-    */
-
 apply {
     if (hdr.probe.tag == 0){
-        if( !IS_CLONE(standard_metadata))
-        {
+        if(standard_metadata.instance_type != INSTANCE_TYPE_EGRESS_CLONE){
+            
+            change_probe_tag(1);  
             do_e2e_clone();
-            change_probe_tag(1);
-
-            /* timer checking will be done here */
-
-            send_packet.apply();
+            send_packet.apply();            
+                     
         }
+
         else {
             send_packet.apply();
         }
+
     }
-    else {
-
-    /* timer check here */
-
-        send_all (standard_metadata.egress_spec); 
-    }
-
-
-}
+ }
 }
 
 /*************************************************************************
@@ -300,7 +330,7 @@ control MyComputeChecksum(inout headers  hdr, inout metadata meta) {
     update_checksum(
         hdr.ipv4.isValid(),
             { hdr.ipv4.version,
-          hdr.ipv4.ihl,
+            hdr.ipv4.ihl,
               hdr.ipv4.diffserv,
               hdr.ipv4.totalLen,
               hdr.ipv4.identification,

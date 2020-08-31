@@ -269,9 +269,9 @@ control MyEgress(inout headers hdr,
 
     // E2E clone to send the clonned packet to the buffer instead of ingress
 
-    action do_e2e_clone(bit <48> smac){
+    action do_e2i_clone(bit <48> smac){
         hdr.ethernet.srcAddr = smac;
-        clone3(CloneType.E2E, (bit<32>) 32w250,standard_metadata);
+        clone3(CloneType.E2I, (bit<32>) 32w250,standard_metadata);
     }
 
     action change_probe_tag(bit <2> tag){
@@ -309,7 +309,7 @@ apply {
         if(standard_metadata.instance_type != INSTANCE_TYPE_EGRESS_CLONE){
             
             change_probe_tag(1);  
-            do_e2e_clone();
+            do_e2i_clone();
             send_packet.apply();            
                      
         }
